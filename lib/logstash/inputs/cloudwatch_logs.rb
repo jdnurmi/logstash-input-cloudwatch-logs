@@ -35,6 +35,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # Value is in seconds.
   config :interval, :validate => :number, :default => 60
 
+  # Expunge logstreams that haven't been written to in greater than :value seconds
+  config :expunge, :validate => :number, :default => -1
   # def register
   public
   def register
@@ -167,6 +169,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     # if there are more pages, continue
     if logs.events.count != 0 && logs.next_forward_token != nil
       process_log_stream(queue, stream, last_read, current_window, logs.next_forward_token)
+    elsif @expunge > 0 and (Time.now.to_i - stream.last_event_timestamp > @expunge)
+      @logger.debug("Expunging old log #{@log_group}/#{stream.log_stream_name}")
+      @cloudwatch.delete_log_stream( :log_group_name => @log_group, :log_stream_name => stream.log_stream_name )
     end
   end # def process_log_stream
 
