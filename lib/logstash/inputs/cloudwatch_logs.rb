@@ -206,7 +206,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         if ::File.exists?(@sincedb_path)
           since = ::File.read(@sincedb_path).chomp.strip.to_i
         else
-          since = 1
+          since = 1454284800
         end
         return since
       end
