@@ -70,8 +70,12 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       params[:next_token] = token
     end
 
-    streams = @cloudwatch.describe_log_streams(params)
-
+    begin
+      streams = @cloudwatch.describe_log_streams(params)
+    rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+      sleep(1)
+      retry
+    end
     objects.push(*streams.log_streams)
     if streams.next_token == nil
       @logger.debug("CloudWatch Logs hit end of tokens for streams")
@@ -147,7 +151,12 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       params[:next_token] = token
     end
 
-    logs = @cloudwatch.get_log_events(params)
+    begin
+      logs = @cloudwatch.get_log_events(params)
+    rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+      sleep(1)
+      retry
+    end
 
     logs.events.each do |log|
       if log.ingestion_time > last_read
