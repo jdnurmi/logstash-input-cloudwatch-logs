@@ -118,6 +118,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     current_window = DateTime.now.strftime('%Q')
 
     objects.each do |stream|
+      @logger.debug("Processing stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
       resp = @ddb.get_item({
         table_name: @state_table,
         key: {
@@ -136,7 +137,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       begin
         last_event = nil
         whence = stream.last_event_timestamp.to_i or stream.creation_time.to_i
-        if @expunge > 0 and Time.now.to_i - whence > @expunge
+        if @expunge > 0 and Time.now.to_i * 1000 - whence > @expunge
             @logger.info("Expunging stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
             # We delete state first, as worst case is we'll replay the stream, whereas in the
             # reverse, we could delete the stream and have state that never gets expunged.
@@ -152,11 +153,15 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
               :log_stream_name => stream.log_stream_name,
             })
             next
+        else
+          @logger.debug("Not expunging", :expunge => @expunge, :whence => whence, :now => Time.now.to_i * 1000)
         end
+
         if (resp.item or {})["last_read"].to_i == stream.last_event_timestamp.to_i
           @logger.debug("No new data in stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
           next
         end
+
         @cloudwatch.get_log_events({
           :log_group_name => @log_group,
           :log_stream_name => stream.log_stream_name,
@@ -183,6 +188,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         # We got throttled paginating a log - we'll have recorded our LKG, we'll resume it
         # the next time thorugh.
         rescues += 1
+        @logger.debug("Cloudwatchlogs throttled", :rescues => rescues, :backoff => rescues ** 0.5)
         sleep(rescues ** 0.5)
         retry
       end
