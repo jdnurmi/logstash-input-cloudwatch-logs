@@ -26,10 +26,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   config :log_group, :validate => :string, :required => true
 
   # Where to write the since database (keeps track of the date
-  # the last handled file was added to S3). The default will write
-  # sincedb files to some path matching "$HOME/.sincedb*"
-  # Should be a path with filename not just a directory.
-  config :sincedb_path, :validate => :string, :default => nil
+  # the last stream was checked from cwlogs).
+  config :state_table, :validate => :string, :default => "cloudwatchlogs"
 
   # Interval to wait between to check the file list again after a run is finished.
   # Value is in seconds.
@@ -45,9 +43,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     @logger.info("Registering cloudwatch_logs input", :log_group => @log_group)
 
-    Aws::ConfigService::Client.new(aws_options_hash)
-
     @cloudwatch = Aws::CloudWatchLogs::Client.new(aws_options_hash)
+    @ddb = Aws::DynamoDB::Client.new(aws_options_hash)
   end #def register
 
   # def run
@@ -70,6 +67,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     if token != nil
       params[:next_token] = token
+    else
+      @logger.info("Enumerating log group", :log_group => @log_group)
     end
 
     begin
@@ -116,105 +115,79 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   def process_group(queue)
     objects = list_new_streams
 
-    last_read = sincedb.read
     current_window = DateTime.now.strftime('%Q')
 
-    if last_read < 0
-      last_read = 1
-    end
-
     objects.each do |stream|
-      if stream.last_ingestion_time && stream.last_ingestion_time > last_read
-        process_log_stream(queue, stream, last_read, current_window)
+      resp = @ddb.get_item({
+        table_name: @state_table,
+        key: {
+          logGroup: @log_group,
+          logStreamName: stream.log_stream_name,
+        }
+      })
+      if resp.item
+        @logger.debug("DynamoDB State", :item => resp.item )
+        # do something with resp.item state
+      else
+        @logger.debug("Empty State", :item => resp.item )
+        # create a new state
+      end
+      rescues = 0
+      begin
+        last_event = nil
+        whence = stream.last_event_timestamp.to_i or stream.creation_time.to_i
+        if @expunge > 0 and Time.now.to_i - whence > @expunge
+            @logger.info("Expunging stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
+            # We delete state first, as worst case is we'll replay the stream, whereas in the
+            # reverse, we could delete the stream and have state that never gets expunged.
+            @ddb.delete_item({
+              table_name: @state_table,
+              key: {
+                logGroup: @log_group,
+                logStreamName: stream.log_stream_name,
+              }
+            })
+            @cloudwatch.delete_log_stream({
+              :log_group_name => @log_group,
+              :log_stream_name => stream.log_stream_name,
+            })
+            next
+        end
+        if (resp.item or {})["last_read"].to_i == stream.last_event_timestamp.to_i
+          @logger.debug("No new data in stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
+          next
+        end
+        @cloudwatch.get_log_events({
+          :log_group_name => @log_group,
+          :log_stream_name => stream.log_stream_name,
+          :start_from_head => true,
+          :start_time => (resp.item.nil?) ? 1 : resp.item["last_read"].to_i,
+        }).each do | page |
+          (page.events or []).each do | event |
+            process_log(queue, event, stream)
+            last_event = event
+          end
+          if last_event
+            @ddb.put_item({
+              table_name: @state_table,
+              item: {
+                logGroup: @log_group,
+                logStreamName: stream.log_stream_name,
+                last_read: last_event.timestamp,
+              }
+            })
+            resp.item = (resp.item or {}).update({ last_read: last_event.timestamp})
+          end
+        end
+      rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+        # We got throttled paginating a log - we'll have recorded our LKG, we'll resume it
+        # the next time thorugh.
+        rescues += 1
+        sleep(rescues ** 0.5)
+        retry
       end
     end
 
-    sincedb.write(current_window)
   end # def process_group
 
-  # def process_log_stream
-  private
-  def process_log_stream(queue, stream, last_read, current_window, token = nil)
-    @logger.debug("CloudWatch Logs processing stream",
-                  :log_stream => stream.log_stream_name,
-                  :log_group => @log_group,
-                  :lastRead => last_read,
-                  :currentWindow => current_window,
-                  :token => token
-    )
-
-    params = {
-        :log_group_name => @log_group,
-        :log_stream_name => stream.log_stream_name,
-        :start_from_head => true
-    }
-
-    if token != nil
-      params[:next_token] = token
-    end
-
-    begin
-      logs = @cloudwatch.get_log_events(params)
-    rescue Aws::CloudWatchLogs::Errors::ThrottlingException
-      sleep(1)
-      retry
-    end
-
-    logs.events.each do |log|
-      if log.ingestion_time > last_read
-        process_log(queue, log, stream)
-      end
-    end
-
-    # if there are more pages, continue
-    if logs.events.count != 0 && logs.next_forward_token != nil
-      process_log_stream(queue, stream, last_read, current_window, logs.next_forward_token)
-    elsif @expunge > 0 and (Time.now.to_i - stream.last_event_timestamp > @expunge)
-      @logger.debug("Expunging old log #{@log_group}/#{stream.log_stream_name}")
-      @cloudwatch.delete_log_stream( :log_group_name => @log_group, :log_stream_name => stream.log_stream_name )
-    end
-  end # def process_log_stream
-
-  private
-  def sincedb
-    @sincedb ||= if @sincedb_path.nil?
-                   @logger.info("Using default generated file for the sincedb", :filename => sincedb_file)
-                   SinceDB::File.new(sincedb_file)
-                 else
-                   @logger.info("Using the provided sincedb_path",
-                                :sincedb_path => @sincedb_path)
-                   SinceDB::File.new(@sincedb_path)
-                 end
-  end
-
-  private
-  def sincedb_file
-    File.join(ENV["HOME"], ".sincedb_" + Digest::MD5.hexdigest("#{@log_group}"))
-  end
-
-  module SinceDB
-    class File
-      def initialize(file)
-        @sincedb_path = file
-      end
-
-      def newer?(date)
-        date > read
-      end
-
-      def read
-        if ::File.exists?(@sincedb_path)
-          since = ::File.read(@sincedb_path).chomp.strip.to_i
-        else
-          since = 1454284800
-        end
-        return since
-      end
-
-      def write(since = nil)
-        since = DateTime.now.strftime('%Q') if since.nil?
-        ::File.open(@sincedb_path, 'w') { |file| file.write(since.to_s) }
-      end
-    end
-  end
 end # class LogStash::Inputs::CloudWatch_Logs
