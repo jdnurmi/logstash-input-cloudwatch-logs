@@ -76,7 +76,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     if token != nil
       params[:next_token] = token
     else
-      @logger.info("Enumerating log group", :log_group => @log_group)
+      @logger.debug("Enumerating log group", :log_group => @log_group)
     end
 
     begin
@@ -134,17 +134,14 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
           logStreamName: stream.log_stream_name,
         }
       })
-      if resp.item
-        @logger.debug("DynamoDB State", :item => resp.item )
-        # do something with resp.item state
-      else
-        @logger.debug("Empty State", :item => resp.item )
-        # create a new state
-      end
+      @logger.debug("Stream state", :state => resp.item , :log_stream_name => stream.log_stream_name)
+
       rescues = 0
+      evt_count = 0
+      stream_fresh = false
       begin
         last_event = nil
-        whence = Integer((stream.last_event_timestamp.to_i or stream.creation_time.to_i)/1000)
+        whence = Integer((stream.last_event_timestamp.to_i  > 0 ? stream.last_event_timestamp.to_i : stream.creation_time.to_i)/1000)
         age = Time.now.to_i - whence
         if @expunge > 0 and whence > 0 and age > @expunge
             @logger.info("Expunging stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name, :reference_time => whence, :age => age)
@@ -175,19 +172,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         end
 
         if (resp.item or {})["last_read"].to_i == stream.last_event_timestamp.to_i
-          @cw.put_metric_data({
-            namespace: "logIngest",
-            metric_data: [{
-              metric_name: "FreshStreams",
-              value: 1.0,
-              unit: "Count",
-            }],
-          })
-          @logger.debug("No new data in stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
+          stream_fresh = true
+          @logger.debug("Stream is fresh", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name, :last_event_timestamp => stream.last_event_timestamp.to_i)
           next
         end
 
         evt_count = 0
+        @logger.debug("Evaluating", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name, :expunge => @expunge, :whence => whence, :now => Time.now.to_i * 1000)
         @cloudwatch.get_log_events({
           :log_group_name => @log_group,
           :log_stream_name => stream.log_stream_name,
@@ -212,6 +203,19 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
             resp.item = (resp.item or {}).update({ last_read: last_event.timestamp})
           end
         end
+      rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+        # We got throttled paginating a log - we'll have recorded our LKG, we'll resume it
+        # the next time thorugh.
+        rescues += 1
+        @logger.info("Cloudwatchlogs throttled", :rescues => rescues, :backoff => rescues ** 0.5)
+        sleep(rescues ** 0.5)
+        retry
+      rescue Aws::DynamoDB::Errors::ProvisionedThroughputExceededException
+        rescues += 1
+        @logger.info("DDB throttled", :rescues => rescues, :backoff => rescues ** 0.5)
+        sleep(rescues ** 0.5)
+        retry
+      ensure
         @cw.put_metric_data({
           namespace: "logIngest",
           metric_data: [
@@ -221,21 +225,16 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
              unit: "Count",
            },
            {
-             metric_name: "ActiveStreams",
+             metric_name: stream_fresh ? "FreshStreams" : "ActiveStreams",
              value: 1,
              unit: "Count",
            },
           ],
         })
-      rescue Aws::CloudWatchLogs::Errors::ThrottlingException
-        # We got throttled paginating a log - we'll have recorded our LKG, we'll resume it
-        # the next time thorugh.
-        rescues += 1
-        @logger.debug("Cloudwatchlogs throttled", :rescues => rescues, :backoff => rescues ** 0.5)
-        sleep(rescues ** 0.5)
-        retry
+
       end
     end
+    @logger.debug("Evaluated all streams in group", :log_group_name => @log_group)
 
   end # def process_group
 
