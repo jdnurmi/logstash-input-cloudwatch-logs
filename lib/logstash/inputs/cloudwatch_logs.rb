@@ -43,6 +43,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
     @logger.info("Registering cloudwatch_logs input", :log_group => @log_group)
 
+    @cw = Aws::CloudWatch::Client.new(aws_options_hash)
     @cloudwatch = Aws::CloudWatchLogs::Client.new(aws_options_hash)
     @ddb = Aws::DynamoDB::Client.new(aws_options_hash)
   end #def register
@@ -152,16 +153,33 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
               :log_group_name => @log_group,
               :log_stream_name => stream.log_stream_name,
             })
+            @cw.put_metric_data({
+              namespace: "logIngest",
+              metric_data: [{
+                metric_name: "DeletedStreams",
+                value: 1.0,
+                unit: "Count",
+              }],
+            })
             next
         else
           @logger.debug("Not expunging", :expunge => @expunge, :whence => whence, :now => Time.now.to_i * 1000)
         end
 
         if (resp.item or {})["last_read"].to_i == stream.last_event_timestamp.to_i
+          @cw.put_metric_data({
+            namespace: "logIngest",
+            metric_data: [{
+              metric_name: "FreshStreams",
+              value: 1.0,
+              unit: "Count",
+            }],
+          })
           @logger.debug("No new data in stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
           next
         end
 
+        evt_count = 0
         @cloudwatch.get_log_events({
           :log_group_name => @log_group,
           :log_stream_name => stream.log_stream_name,
@@ -171,6 +189,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
           (page.events or []).each do | event |
             process_log(queue, event, stream)
             last_event = event
+            evt_count += 1
           end
           if last_event
             @ddb.put_item({
@@ -184,6 +203,21 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
             resp.item = (resp.item or {}).update({ last_read: last_event.timestamp})
           end
         end
+        @cw.put_metric_data({
+          namespace: "logIngest",
+          metric_data: [
+           {
+             metric_name: "RecordedEvents",
+             value: evt_count,
+             unit: "Count",
+           },
+           {
+             metric_name: "ActiveStreams",
+             value: 1,
+             unit: "Count",
+           },
+          ],
+        })
       rescue Aws::CloudWatchLogs::Errors::ThrottlingException
         # We got throttled paginating a log - we'll have recorded our LKG, we'll resume it
         # the next time thorugh.
