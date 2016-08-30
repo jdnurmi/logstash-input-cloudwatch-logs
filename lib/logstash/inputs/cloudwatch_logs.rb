@@ -144,9 +144,10 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       rescues = 0
       begin
         last_event = nil
-        whence = stream.last_event_timestamp.to_i or stream.creation_time.to_i
-        if @expunge > 0 and Time.now.to_i * 1000 - whence > @expunge
-            @logger.info("Expunging stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name)
+        whence = Integer((stream.last_event_timestamp.to_i or stream.creation_time.to_i)/1000)
+        age = Time.now.to_i - whence
+        if @expunge > 0 and whence > 0 and age > @expunge
+            @logger.info("Expunging stream", :log_group_name => @log_group, :log_stream_name => stream.log_stream_name, :reference_time => whence, :age => age)
             # We delete state first, as worst case is we'll replay the stream, whereas in the
             # reverse, we could delete the stream and have state that never gets expunged.
             @ddb.delete_item({
