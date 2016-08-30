@@ -35,6 +35,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   # Expunge logstreams that haven't been written to in greater than :value seconds
   config :expunge, :validate => :number, :default => -1
+
+  # Seconds from realtime to stop feeds;  Since we record state from last read,
+  # items 'prior' to the tail that are inserted after our poll will be unobserved
+  # by the reader.  It's recommended you keep this at the 99.9+ %ile to reduce the
+  # probability of stream interlacing / latency causing any record loss.
+  config :tail, :validate => :number, :default => 0
+
   # def register
   public
   def register
@@ -185,6 +192,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
           :log_stream_name => stream.log_stream_name,
           :start_from_head => true,
           :start_time => (resp.item.nil?) ? 1 : resp.item["last_read"].to_i,
+          :end_time => (Time.now.to_i - @tail) * 1000,
         }).each do | page |
           (page.events or []).each do | event |
             process_log(queue, event, stream)
